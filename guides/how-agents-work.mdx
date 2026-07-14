@@ -1,0 +1,129 @@
+---
+title: 'How AI Agents Work'
+description: 'A first-principles look at context, memory, skills, and instruction files in LLM agents'
+icon: 'robot'
+---
+
+An "agent" is not a new kind of model. It's an LLM wired into a **loop**, given **tools**, and fed a carefully assembled bundle of text called **context**. Everything that feels like "agent behavior" — planning, remembering, following house style, calling APIs — comes from how that loop and that context are engineered, not from anything architecturally new inside the model itself.
+
+This page breaks the system into its core parts: the loop, context, memory, skills, and instruction files (`CLAUDE.md`-style docs) — and how they fit together.
+
+## The core loop
+
+At the center of every agent is a simple cycle:
+
+<Steps>
+  <Step title="Assemble context">
+    Gather the system prompt, tool definitions, conversation so far, and any retrieved knowledge into one prompt.
+  </Step>
+  <Step title="Call the model">
+    The LLM reads that context and produces either a text response or a request to call a tool.
+  </Step>
+  <Step title="Act">
+    If it's a tool call, the harness executes it (read a file, hit an API, run a shell command) — this is the only place the agent touches the outside world.
+  </Step>
+  <Step title="Observe">
+    The tool's result is appended back into the context as a new message.
+  </Step>
+  <Step title="Repeat">
+    The loop runs again with the updated context, until the model decides to stop and respond to the user.
+  </Step>
+</Steps>
+
+This is the whole trick. There is no separate "planning module" or "memory module" living outside the model — planning is just the model reasoning in text, and memory is just text that gets included (or not) in the next iteration's context.
+
+<Note>
+This is why prompt engineering and context engineering matter so much for agents: the model's entire "world" at each step is whatever text made it into the prompt. Nothing else exists to it.
+</Note>
+
+## Context: the agent's entire universe
+
+The **context window** is the fixed-size buffer of tokens the model sees on every single call. For an agent, it typically contains, in order:
+
+- **System prompt** — the agent's identity, rules of engagement, and behavioral defaults
+- **Tool definitions** — JSON schemas describing what tools exist and how to call them
+- **Instruction files** — project- or org-specific docs pulled in automatically (see below)
+- **Conversation history** — every user message, assistant message, and tool result so far
+- **Retrieved content** — anything pulled in on demand (file contents, search results, docs)
+
+Two consequences follow directly from this being a *fixed-size* window:
+
+1. **Everything competes for space.** A 50,000-token file dumped into context crowds out room for reasoning and history. Good agents fetch narrowly (grep before cat, search before browse) rather than loading everything "just in case."
+2. **Long sessions need compaction.** Once history approaches the context limit, older turns are summarized or dropped so the session can continue. This is *lossy* — an agent working from a compacted summary has strictly less information than one with the raw history, which is why well-designed agents write important facts down to durable storage rather than relying on the conversation staying in context forever.
+
+## Memory: three different things people call "memory"
+
+"Memory" is overloaded. It's worth separating three distinct mechanisms:
+
+<CardGroup cols={1}>
+  <Card title="In-context memory" icon="clock">
+    The conversation history itself. Free, automatic, but bounded by the context window and gone once the session ends (or gets compacted away).
+  </Card>
+  <Card title="Durable memory" icon="floppy-disk">
+    Facts written to a file, database, or key-value store that persist *across* sessions and get deliberately re-loaded into context later. This is memory the agent (or a hook) has to actively write and actively retrieve — it does not happen for free.
+  </Card>
+  <Card title="Retrieved memory (RAG)" icon="magnifying-glass">
+    A large corpus (docs, code, past tickets) that's too big to fit in context at all. An embedding search or grep pulls in just the relevant slice for the current task, on demand.
+  </Card>
+</CardGroup>
+
+The common failure mode is treating conversation history as if it were durable memory — assuming the agent will "remember" something next week because it was mentioned once. It won't, unless something explicitly wrote that fact somewhere that gets re-read later.
+
+## Instruction files (`CLAUDE.md` and friends)
+
+Most agent frameworks support a plain Markdown file — `CLAUDE.md`, `AGENTS.md`, `.cursorrules`, etc. — that gets **automatically prepended to context** at the start of a session, scoped to a directory or project. This is durable memory's simplest form: a human writes it once, and it's silently re-injected every time.
+
+What belongs in one:
+
+- Build/test/lint commands specific to this repo (things the agent would otherwise have to rediscover every session)
+- Non-obvious conventions ("we use tabs," "never edit `generated/`," "always run migrations before tests")
+- Pointers to where things live, when the repo layout isn't self-explanatory
+
+What doesn't belong: anything discoverable by reading the code, or anything that changes often (that belongs in the code or in a ticket, not a doc the agent trusts blindly). A stale instruction file is worse than none — the agent will follow it confidently even after it's wrong.
+
+These files usually **stack**: a user-level file (personal preferences), a repo-root file (project conventions), and directory-scoped files (subsystem-specific notes) can all load at once, most-specific taking precedence.
+
+## Skills: packaged, on-demand expertise
+
+A **skill** is a step up from a static instructions file: a named, discoverable bundle of instructions (and sometimes scripts or reference files) for a *specific kind of task*, that the agent chooses to load only when it's relevant — rather than every file being crammed into the system prompt up front.
+
+The key idea is **progressive disclosure**:
+
+1. The agent only sees a one-line name + description for every available skill, up front — cheap, doesn't crowd context.
+2. When a task matches, the agent explicitly invokes that skill, and *only then* does its full body of instructions get loaded into context.
+3. Some skills bundle extra files (checklists, scripts, reference data) that load even later, only if the skill's own instructions say to read them.
+
+This solves the tension between "the agent should know how to do hundreds of specialized things" and "the context window is small." Skills are memory that's organized by *task* rather than dumped in as one undifferentiated blob, and loaded lazily instead of eagerly.
+
+Compare to instruction files: a `CLAUDE.md` is always-on background knowledge ("here's how this repo works"); a skill is opt-in procedural knowledge ("here's exactly how to do X," loaded only when X comes up).
+
+## Tools: the only way an agent affects anything
+
+An LLM by itself only produces text. **Tools** are the bridge to the outside world — each one is a function the model can request by name with structured arguments; the *harness* (not the model) actually executes it and returns a result.
+
+A few properties matter for agent design:
+
+- **The model never directly executes anything.** It emits a request; a privileged layer outside the model decides whether to honor it. This is the natural place to put permission checks, sandboxing, and approval prompts.
+- **Tool descriptions are prompts too.** A vaguely-named tool or an ambiguous parameter description degrades tool-selection accuracy just like a vague instruction would.
+- **Results become context.** A tool that returns 200KB of JSON just spent 200KB of the agent's limited window. Well-designed tools filter and summarize server-side rather than dumping raw data on the model.
+
+## Subagents: spending context you don't have
+
+Delegating a subtask to a **subagent** launches a fresh model instance with its own empty context window, a scoped prompt describing just that task, and (usually) a restricted toolset. When it finishes, only its *final summary* — not its full working transcript — returns to the parent.
+
+This is a context-management technique as much as a task-decomposition one: research that would burn 50,000 tokens of exploration in the main conversation can happen in a subagent's disposable context, leaving the parent with only the distilled answer. The tradeoff is that the subagent starts cold — it has none of the parent's conversation history, so the parent has to write a self-contained brief rather than assuming shared context.
+
+## Putting it together
+
+An agent's competence at a task is really the sum of a few independent design decisions:
+
+| Layer | Question it answers | Failure mode when done poorly |
+|---|---|---|
+| System prompt | Who is this agent and what are its defaults? | Inconsistent behavior across sessions |
+| Instruction files | What does this agent need to know about *this* environment? | Rediscovers the same facts every session |
+| Skills | What specialized procedures can it invoke on demand? | Either bloated context (all loaded eagerly) or missed capability (nothing packaged) |
+| Tools | What can it actually *do*? | Either too coarse (can't do the task) or too raw (drowns context in unfiltered output) |
+| Memory | What persists beyond this conversation? | Repeats mistakes, forgets user preferences |
+| Subagents | What work should happen off to the side? | Main context fills with exploration noise |
+
+None of these require a different model. They're all context-and-orchestration engineering around a model that just predicts the next token — which is also why they're worth understanding directly, rather than treating "the agent" as a black box.
